@@ -1,0 +1,21 @@
+# dsh-web-preview bundle patch.
+#
+# 一行 insert 即挂载 Host 半身；浏览器半身由 package.json 的 dsh.client 声明，
+# 并绑定在 name 为裸包名的这一行上（子路径行不会携带半身）。
+#
+# config (all optional):
+#   defaultUpstream: string  — optional fixed upstream for bare /web-preview/<path>
+#       (legacy/quick form). e.g. "http://127.0.0.1:4173". Leave empty to use
+#       only the dynamic /web-preview/__proxy/<origin>/<path> form.
+#   defaultUrl: string       — the URL the Client prefills in its toolbar.
+#       e.g. "http://127.0.0.1:4173/".
+#   extraAliases: array      — extra DSH-origin prefixes forwarded to a local
+#       service; needed when a previewed app makes root-absolute requests that
+#       must stay on the same origin but are NOT under /web-preview. Each entry:
+#       { prefix: '/cesium', origin: '127.0.0.1:4173', path: '/cesium' }
+#   logPath: string          — optional override for the browser-error log
+#       (defaults to the OS temp dir).
+- insert:
+    - id: dsh-web-preview
+      name: 'dsh-web-preview'
+      config: {}
