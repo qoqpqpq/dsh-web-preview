@@ -1,6 +1,6 @@
 {
   "name": "dsh-web-preview",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Preview any local web server inside the DeepSeek Harness GUI — remote-browser-safe same-origin proxy with an embedded tab, floating window, and a Console/Network/Errors diagnostic toolbox. Works from any DSH origin (https + reverse proxy) without mixed-content or localhost pitfalls.",
   "type": "module",
   "main": "./index.js",
@@ -16,8 +16,21 @@
     "README.md",
     "LICENSE"
   ],
-  "keywords": ["dsh", "dsh-plugin", "browser", "web-preview", "iframe", "proxy", "devtools", "local-server"],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "browser",
+    "web-preview",
+    "iframe",
+    "proxy",
+    "devtools",
+    "local-server"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qoqpqpq/dsh-web-preview.git"
+  },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
@@ -26,8 +39,12 @@
     "react": "^18.2.0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "react": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
   },
   "dsh": {
     "bundle": {
