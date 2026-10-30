@@ -190,7 +190,7 @@ export function apply(ctx, config) {
         let origin
         try { origin = decodeURIComponent(encOrigin) } catch { origin = '' }
         if (!origin) { res.writeHead(400); res.end('web-preview: missing origin'); return }
-        proxy(req, res, origin, upstreamPath)
+        proxy(req, res, origin, upstreamPath, { subPrefix: APP_PREFIX + '/__proxy/' + encOrigin + '/' })
       },
     }), 'web-preview: dynamic proxy route')
 
@@ -231,8 +231,16 @@ function stripPrefix(url, prefix) {
  * Forward one request to a local `origin` (host[:port]) at `upstreamPath`.
  * HTML responses have a capture script injected so the user's browser reports
  * console output, network activity and runtime errors back to the host.
+ *
+ * `opts.subPrefix` — when the proxy runs under a sub-path (e.g.
+ * `/web-preview/__proxy/<enc>/`), root-absolute asset references in the
+ * HTML (`src="/assets/x"`, `href="/cesium/y"`) are rewritten to be relative
+ * to that sub-path, and a bootstrap script patches the browser history so a
+ * BrowserRouter SPA keeps matching its routes under the sub-path. Passed
+ * through to the HTML rewriter; `undefined` disables rewriting.
  */
-function proxy(req, res, origin, upstreamPath) {
+function proxy(req, res, origin, upstreamPath, opts) {
+  opts = opts || {}
   let upstream
   try {
     const base = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(origin) ? origin : 'http://' + origin)
@@ -269,6 +277,7 @@ function proxy(req, res, origin, upstreamPath) {
       up.on('data', c => chunks.push(c))
       up.on('end', () => {
         let html = Buffer.concat(chunks).toString('utf8')
+        if (opts.subPrefix) html = rewriteForSubPath(html, opts.subPrefix)
         html = injectCaptureScript(html)
         const body = Buffer.from(html, 'utf8')
         outHeaders['content-length'] = String(body.length)
@@ -290,6 +299,54 @@ function proxy(req, res, origin, upstreamPath) {
     }
   })
   req.pipe(fwd)
+}
+
+/**
+ * Rewrite a proxied HTML document for a sub-path so that root-absolute
+ * assets and BrowserRouter SPAs keep working.
+ *
+ * Two problems, one fix:
+ *   1. Assets: `src="/assets/x"` / `href="/cesium/y"` resolve against the
+ *      DSH origin (not the upstream), so they 404 or hit the wrong service.
+ *      Rewriting them to `sub + path` makes them go through the proxy to the
+ *      correct upstream (which serves the real files).
+ *   2. Routing: a BrowserRouter reads `location.pathname` and matches routes
+ *      against it. Under a sub-path it sees `/web-preview/__proxy/<enc>/gis`
+ *      instead of `/gis`, so NO route matches → blank page. We inject a
+ *      bootstrap script that makes `location.pathname` appear to start at the
+ *      sub-path root, and strips the prefix when the app navigates via
+ *      `history.pushState`/`replaceState`.
+ *
+ * `sub` must end with `/` and is the URL prefix of the proxied app relative
+ * to the DSH origin (e.g. `/web-preview/__proxy/127.0.0.1%3A3001/`).
+ */
+function rewriteForSubPath(html, sub) {
+  // 1) Prefix root-absolute src/href attributes so they route through the proxy.
+  //    e.g. src="/assets/index.js"  ->  src="<sub>assets/index.js"
+  //    Skip data:, http(s):, //, #, and already-prefixed refs.
+  html = html.replace(/(\b(?:src|href)\s*=\s*["'])\/(?![\/"'])/g, (m, q) => q + sub)
+
+  // 2) Bootstrap script (runs before the app's module scripts) that makes the
+  //    browser history / location appear rooted at the sub-path.
+  const boot = `<script>(function(){
+var SUB=${JSON.stringify(sub)};
+// location.pathname getter: strip the sub-path so app code sees "/gis" etc.
+var __origPath=Object.getOwnPropertyDescriptor(location,'pathname');
+if(__origPath&&__origPath.get){try{
+  var g=__origPath.get;Object.defineProperty(location,'pathname',{get:function(){
+    var p=g.call(location);return p.indexOf(SUB)===0?p.slice(SUB.length-1):p;}});
+}catch(e){}}
+// history.pushState/replaceState: rewrite URLs so the browser's real path keeps
+// the sub-prefix while the app thinks it navigated to the sub-rooted path.
+function wrap(fn){return function(state,title,url){
+  if(typeof url==='string'&&url.indexOf('/')===0&&url.indexOf(SUB)!==0){
+    url=SUB+url.slice(1);}
+  return fn.call(this,state,title,url);};}
+try{history.pushState=wrap(history.pushState);history.replaceState=wrap(history.replaceState);}catch(e){}
+})();</script>`
+  const at = html.toLowerCase().lastIndexOf('</head>')
+  if (at >= 0) return html.slice(0, at) + boot + html.slice(at)
+  return boot + html
 }
 
 /**
