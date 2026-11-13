@@ -35,6 +35,7 @@
  */
 
 import http from 'node:http'
+import https from 'node:https'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -330,7 +331,7 @@ function proxy(req, res, origin, upstreamPath, opts) {
     headers['content-length'] = String(req.headers['content-length'] ?? 0)
   }
 
-  const fwd = http.request({
+  const fwd = transportFor(upstream.protocol).request({
     hostname: upstream.hostname,
     port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
     path: upstream.pathname + upstream.search,
@@ -486,6 +487,16 @@ function probeErrorKind(err) {
  *
  * `done(result)` always fires exactly once with `{ ok, status, ms, error? }`.
  */
+/**
+ * Pick the right transport module for an upstream protocol. Both the proxy and
+ * the probe must use `https.request` for `https:` upstreams — `http.request`
+ * against port 443 sends a plaintext request to a TLS port and fails with a
+ * confusing 400 / ECONNRESET.
+ */
+function transportFor(protocol) {
+  return protocol === 'https:' ? https : http
+}
+
 function probe(parsedUrl, timeoutMs, done, method, redirects) {
   method = method || 'HEAD'
   redirects = redirects || 0
@@ -503,7 +514,7 @@ function probe(parsedUrl, timeoutMs, done, method, redirects) {
   }, timeoutMs)
 
   try {
-    req = http.request({
+    req = transportFor(parsedUrl.protocol).request({
       hostname: parsedUrl.hostname,
       port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
