@@ -15,6 +15,10 @@
 #       { prefix: '/cesium', origin: '127.0.0.1:4173', path: '/cesium' }
 #   logPath: string          — optional override for the browser-error log
 #       (defaults to the OS temp dir).
+#   timeoutMs: number        — client load clock (ms): how long the toolbar waits
+#       for the iframe `onload` before declaring a timeout and probing. Omit to
+#       use the client's built-in default (20000ms).
+#   probeTimeoutMs: number   — server-side /__probe timeout (ms). Default ~8000ms.
 - insert:
     - id: dsh-web-preview
       name: 'dsh-web-preview'

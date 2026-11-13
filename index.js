@@ -19,9 +19,11 @@
  *   /web-preview/__report   POST   browser errors (from capture script)
  *   /web-preview/__console  POST   browser console output (from capture script)
  *   /web-preview/__network  POST   browser network activity (from capture script)
+ *   /web-preview/__metric   POST   client-measured load timing/failure {loadId,url,ms,ok}
  *   /web-preview/__events   GET    buffered diagnostics for the Client devtools
  *   /web-preview/__clear    POST   reset the diagnostic buffer (devtools Clear)
  *   /web-preview/__config   GET    the plugin config (Client reads defaults)
+ *   /web-preview/__probe    GET    server-side reachability probe ?u=<url> -> {ok,status,ms,error?}
  *   /web-preview/__proxy/<enc(origin)>/<path>  GET/POST/PUT/...  ->  http://<origin>/<path>
  *   /web-preview/<path>     GET/POST/...        ->  defaultUpstream/<path>   (only if defaultUpstream set)
  *   <alias>/<path>          GET/POST/...        ->  alias.origin + alias.path/<path>   (per extraAliases entry)
@@ -46,9 +48,21 @@ const APP_PREFIX = '/web-preview'
 // dir so it never writes into a user's home directory.
 const DEFAULT_LOG = path.join(os.tmpdir(), 'dsh-web-preview-errors.log')
 
+// ── named tunables (no magic numbers scattered through the handlers) ─────────
+// Cap on the diagnostic event ring buffer.
+const EVENTS_MAX = 2000
+// Cap on one JSON POST body we are willing to buffer (capture-script reports).
+const BODY_MAX_BYTES = 131072
+// Default server-side probe timeout. Overridable per-deployment via config
+// `probeTimeoutMs`; the client's own load clock uses `timeoutMs` (its own const).
+const PROBE_TIMEOUT_MS = 8000
+// Redirects the probe will follow before giving up (we only need a status).
+const PROBE_MAX_REDIRECTS = 4
+// Cap on how much of an upstream probe body we read — we only need the status.
+const PROBE_BODY_MAX_BYTES = 65536
+
 // ── diagnostic event buffer ────────────────────────────────────────────────
 const EVENTS = []
-const EVENTS_MAX = 2000
 let EVENT_SEQ = 0
 function pushEvent(type, payload) {
   const ev = Object.assign({ id: ++EVENT_SEQ, t: Date.now(), type }, payload || {})
@@ -71,10 +85,16 @@ export function apply(ctx, config) {
   //   under /web-preview. e.g. Cesium's hardcoded /cesium/.
   //   [{ prefix: '/cesium', origin: '127.0.0.1:4173', path: '/cesium' }]
   // logPath: optional override for the error log.
+  // timeoutMs: optional client load clock (ms) — how long the Client waits for
+  //   the iframe `onload` before declaring a timeout and probing. Falls back to
+  //   the client's own const when absent.
+  // probeTimeoutMs: optional server-side probe timeout (ms) for /__probe.
   const defaultUpstream = cfg.defaultUpstream || ''
   const defaultUrl = cfg.defaultUrl || ''
   const extraAliases = Array.isArray(cfg.extraAliases) ? cfg.extraAliases : []
   const errorLog = cfg.logPath || DEFAULT_LOG
+  const timeoutMs = Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs > 0 ? cfg.timeoutMs : null
+  const probeTimeoutMs = Number.isFinite(cfg.probeTimeoutMs) && cfg.probeTimeoutMs > 0 ? cfg.probeTimeoutMs : PROBE_TIMEOUT_MS
 
   const aliasRoutes = []
   for (const a of extraAliases) {
@@ -89,7 +109,7 @@ export function apply(ctx, config) {
     // Collect one JSON POST body (capped).
     const readJson = (req, cb) => {
       let body = ''
-      req.on('data', c => { body += c; if (body.length > 131072) req.destroy() })
+      req.on('data', c => { body += c; if (body.length > BODY_MAX_BYTES) req.destroy() })
       req.on('end', () => {
         let data = null
         try { data = JSON.parse(body || '{}') } catch { data = { raw: body } }
@@ -138,6 +158,24 @@ export function apply(ctx, config) {
       },
     }), 'web-preview: network route')
 
+    // POST /web-preview/__metric  — client-measured load timing/failure.
+    // The client races iframe `onload` against a timeout clock and reports the
+    // outcome here: { loadId, url, ms, ok, reason? }. Cross-origin iframes hide
+    // load status from the parent, so this client-side clock + the host probe
+    // are the only reliable timing/failure signals. Recorded as a `metric`
+    // event so it shows up in the devtools buffer.
+    scoped.effect(() => server.register({
+      kind: 'exact',
+      path: APP_PREFIX + '/__metric',
+      handler: (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+        readJson(req, (data) => {
+          pushEvent('metric', data || {})
+          res.writeHead(204); res.end()
+        })
+      },
+    }), 'web-preview: load metric route')
+
     // GET /web-preview/__events?since=<id> — buffered diagnostics
     scoped.effect(() => server.register({
       kind: 'exact',
@@ -174,9 +212,40 @@ export function apply(ctx, config) {
           defaultUrl,
           defaultUpstream: defaultUpstream || null,
           extraAliases: aliasRoutes,
+          // Client load clock (ms); null → client uses its own const default.
+          timeoutMs: timeoutMs,
+          probeTimeoutMs,
         }))
       },
     }), 'web-preview: config route')
+
+    // GET /web-preview/__probe?u=<urlencoded target url>
+    // Server-side reachability probe. Cross-origin iframes hide HTTP status and
+    // load errors from the parent, so this is the ONLY way the Client can tell
+    // "service not started" apart from "page 404" apart from "DNS/network down".
+    // Does a HEAD (falling back to GET on 405/404/403), follows a bounded number
+    // of redirects, caps the body, and returns { ok, status, ms, error? } where
+    // `error` is a short friendly code. Never throws; always answers JSON.
+    scoped.effect(() => server.register({
+      kind: 'exact',
+      path: APP_PREFIX + '/__probe',
+      handler: (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405); res.end(); return }
+        const q = (req.url || '').split('?')[1] || ''
+        let target = ''
+        for (const kv of q.split('&')) {
+          const i = kv.indexOf('=')
+          if (i > 0 && kv.slice(0, i) === 'u') { try { target = decodeURIComponent(kv.slice(i + 1)) } catch (_) { target = '' } break }
+        }
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+        if (!target) { res.end(JSON.stringify({ ok: false, status: 0, ms: 0, error: 'empty' })); return }
+        let parsed
+        try { parsed = new URL(target) } catch (_) { res.end(JSON.stringify({ ok: false, status: 0, ms: 0, error: 'invalid' })); return }
+        probe(parsed, probeTimeoutMs, (result) => {
+          try { res.end(JSON.stringify(result)) } catch (_) { try { res.end('{"ok":false,"error":"other"}') } catch (_) {} }
+        })
+      },
+    }), 'web-preview: probe route')
 
     // /web-preview/__proxy/<enc(origin)>/<path>  ->  http://<origin>/<path>
     scoped.effect(() => server.register({
@@ -384,4 +453,102 @@ function pickResponseHeaders(up) {
     if (v !== undefined) out[k] = v
   }
   return out
+}
+
+/**
+ * Map a low-level probe error to a short, friendly code the Client can render.
+ * These cover the cases that actually matter when a local preview fails:
+ *   dns     — the hostname didn't resolve (typo, or a name only the browser knows)
+ *   refused — nothing is listening on that port (service not started) — the
+ *             single most common "why is my preview blank" cause
+ *   timeout — the target didn't answer within the probe budget (slow/hung)
+ *   cert    — TLS problem (self-signed, expired, depth-zero chain)
+ *   aborted — the request was cut short (proxy shutdown, socket destroyed)
+ *   other   — anything else; the Client falls back to a generic message
+ */
+function probeErrorKind(err) {
+  const code = (err && err.code) || ''
+  const msg = String((err && err.message) || '')
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'ENOTDIR') return 'dns'
+  if (code === 'ECONNREFUSED') return 'refused'
+  if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') return 'timeout'
+  if (code.startsWith('CERT') || code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || code === 'SELF_SIGNED_CERT_IN_CHAIN' || /certificate|self-signed|tls|ssl/i.test(msg)) return 'cert'
+  if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ECONNABORTED' || code === 'ABORT_ERR') return 'aborted'
+  return 'other'
+}
+
+/**
+ * Probe one absolute URL from the DSH host. Tries HEAD first (cheap, no body);
+ * on 405/404/403 — where a server may not implement HEAD or may reject it —
+ * retries with GET. Follows up to PROBE_MAX_REDIRECTS redirects (switching to
+ * GET for those, since 3xx bodies/redirects are conventionally GET). Caps the
+ * buffered body so a chatty endpoint can't tie up the host.
+ *
+ * `done(result)` always fires exactly once with `{ ok, status, ms, error? }`.
+ */
+function probe(parsedUrl, timeoutMs, done, method, redirects) {
+  method = method || 'HEAD'
+  redirects = redirects || 0
+  const started = Date.now()
+  let settled = false
+  const finish = (result) => {
+    if (settled) return
+    settled = true
+    done(result)
+  }
+  let req
+  const timer = setTimeout(() => {
+    try { req.destroy() } catch (_) {}
+    finish({ ok: false, status: 0, ms: Date.now() - started, error: 'timeout' })
+  }, timeoutMs)
+
+  try {
+    req = http.request({
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method,
+      headers: { host: parsedUrl.host, 'user-agent': 'dsh-web-preview-probe' },
+    }, (up) => {
+      const status = up.statusCode ?? 0
+      // Consume/cap the body so the socket is released; we only need the status.
+      let seen = 0
+      up.on('data', (c) => {
+        seen += c.length
+        if (seen > PROBE_BODY_MAX_BYTES) { try { up.destroy() } catch (_) {} }
+      })
+      up.on('end', () => {})
+      up.on('error', () => {})
+      const ms = Date.now() - started
+      const loc = up.headers.location
+      if (status >= 300 && status < 400 && loc && redirects < PROBE_MAX_REDIRECTS) {
+        let next
+        try { next = new URL(loc, parsedUrl) } catch (_) { next = null }
+        clearTimeout(timer)
+        if (!next || !/^https?:$/.test(next.protocol)) {
+          finish({ ok: status < 400, status, ms, error: status < 400 ? undefined : 'other' })
+          return
+        }
+        probe(next, timeoutMs, finish, 'GET', redirects + 1)
+        return
+      }
+      const ok = status >= 200 && status < 400
+      clearTimeout(timer)
+      // A 405/404/403 to HEAD is often just "no HEAD support"/"auth on HEAD";
+      // retry once with GET before reporting the status as-is.
+      if (!ok && method === 'HEAD' && (status === 405 || status === 404 || status === 403)) {
+        probe(parsedUrl, timeoutMs, finish, 'GET', redirects)
+        return
+      }
+      finish({ ok, status, ms, error: ok ? undefined : 'http' })
+    })
+    req.on('error', (err) => {
+      clearTimeout(timer)
+      finish({ ok: false, status: 0, ms: Date.now() - started, error: probeErrorKind(err) })
+    })
+    req.end()
+  } catch (err) {
+    clearTimeout(timer)
+    finish({ ok: false, status: 0, ms: Date.now() - started, error: probeErrorKind(err) })
+  }
 }
