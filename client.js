@@ -278,7 +278,10 @@ window.__ModuleLoader__.load({
       const dot = el('span', { className: 'wprev-dot' })
       const title = el('span', { className: 'wprev-title' }, opts.title || 'WEB PREVIEW')
       const urlInput = el('input', { className: 'wprev-url', type: 'text', placeholder: 'localhost:5173  or  https://example.com' })
-      if (opts.defaultUrl) urlInput.value = opts.defaultUrl
+      // Prefer a previously-loaded URL so switching conversations/views does
+      // not lose the address; fall back to the configured default.
+      if (persistedUrl) urlInput.value = persistedUrl
+      else if (opts.defaultUrl) urlInput.value = opts.defaultUrl
       const goBtn = el('button', { className: 'wprev-btn primary' }, 'GO')
       const reloadBtn = el('button', { className: 'wprev-btn', title: 'Reload' }, '\u21BB')
       const extA = el('a', { className: 'wprev-btn', target: '_blank', rel: 'noreferrer noopener', title: 'Open in new tab' }, '\u2197')
@@ -302,6 +305,7 @@ window.__ModuleLoader__.load({
         // Keep the toolbar showing the HUMAN-readable input, not the proxy path.
         urlInput.value = u
         currentUrl = target
+        persistedUrl = u
         if (frame) { try { frameWrap.removeChild(frame) } catch (_) {} }
         frame = el('iframe', {
           className: 'wprev-frame',
@@ -357,6 +361,13 @@ window.__ModuleLoader__.load({
         win = el('div', { className: 'wprev-embed-view' }, head, frameWrap)
       }
 
+      // Auto-restore the last-loaded URL: a rebuilt panel (e.g. after switching
+      // conversations) should re-open the previous address instead of leaving
+      // the frame area empty and requiring the user to type it again.
+      if (persistedUrl) {
+        try { loadUrl() } catch (_) {}
+      }
+
       return {
         root: win,
         head,
@@ -401,6 +412,11 @@ window.__ModuleLoader__.load({
     // Config default URL, fetched from the host's /web-preview/__config and
     // used to prefill the toolbar. Empty until loaded.
     let defaultUrl = ''
+
+    // Last URL the user loaded, kept at module scope so the preview survives
+    // slot unmount/remount (e.g. switching conversations), which would
+    // otherwise rebuild the panel from scratch and lose the address.
+    let persistedUrl = ''
 
     function apply(ctx) {
       console.info('[dsh-web-preview] apply entered')
