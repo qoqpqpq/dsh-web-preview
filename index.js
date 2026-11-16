@@ -220,6 +220,62 @@ export function apply(ctx, config) {
       },
     }), 'web-preview: config route')
 
+    // GET /web-preview/__sandbox-check?target=<urlencoded>
+    // Same-origin diagnostic page. Loads the target through the proxy inside an
+    // iframe that uses the EXACT sandbox attribute the real preview uses, so the
+    // user can see the frame's own content and any errors it throws — the same
+    // origin means those errors are observable, unlike inside the deployed
+    // preview where cross-origin frames hide everything. Opens the door to
+    // telling "proxy is fine but the app itself fails in the sandbox" apart from
+    // "the proxy broke the page".
+    scoped.effect(() => server.register({
+      kind: 'exact',
+      path: APP_PREFIX + '/__sandbox-check',
+      handler: (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405); res.end(); return }
+        let target = ''
+        try {
+          const u = new URL(req.url || '/', 'http://x')
+          target = u.searchParams.get('target') || ''
+        } catch (_) {}
+        const sbFull = 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox'
+        const sbMin = 'allow-scripts allow-same-origin'
+        const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>web-preview sandbox check</title><style>
+body{font:14px/1.5 system-ui,sans-serif;margin:0;padding:16px;background:#f5f5f7;color:#222}
+h2{font-size:15px;margin:14px 0 4px}
+.grid{display:flex;gap:10px}.col{flex:1}.frame{height:300px;border:1px solid #ccc;border-radius:8px;overflow:hidden;background:#fff}
+.frame iframe{width:100%;height:100%;border:0;display:block}
+.cap{font-size:12px;color:#666;margin:2px 0 8px}code{background:#eee;padding:1px 4px;border-radius:4px;font-size:11px;word-break:break-all}
+.ok{color:#16a34a;font-weight:600}.bad{color:#dc2626;font-weight:600}
+</style></head><body>
+<h2>web-preview 沙箱对比诊断</h2>
+<p class="cap">三个 iframe 都通过<strong>同一个代理</strong>加载目标页,只有 sandbox 不同。哪个能正常显示,就说明该用那种 sandbox 配置。</p>
+<p class="cap">目标: <code>${target.replace(/[<>&]/g, '')}</code></p>
+<div class="grid">
+  <div class="col"><div class="frame"><iframe id="f0"></iframe></div><p class="cap"><strong>① 无 sandbox</strong><br><span id="s0">加载中…</span></p></div>
+  <div class="col"><div class="frame"><iframe id="f1" sandbox="${sbMin}"></iframe></div><p class="cap"><strong>② 最小 sandbox</strong><br><code>allow-scripts allow-same-origin</code><br><span id="s1">加载中…</span></p></div>
+  <div class="col"><div class="frame"><iframe id="f2" sandbox="${sbFull}"></iframe></div><p class="cap"><strong>③ 插件当前 sandbox</strong><br><code>${sbFull}</code><br><span id="s2">加载中…</span></p></div>
+</div>
+<script>
+(function(){
+  var enc = encodeURIComponent(${JSON.stringify(target)});
+  var url = location.origin + '${APP_PREFIX}/__proxy/' + enc + '/';
+  var ids = ['f0','f1','f2'], st = ['s0','s1','s2'];
+  for (var i=0;i<ids.length;i++){
+    (function(idx){
+      var f = document.getElementById(ids[idx]);
+      f.onload = function(){ document.getElementById(st[idx]).innerHTML = '<span class="ok">onload 已触发</span>（看上面是否白屏）'; };
+      f.src = url;
+    })(i);
+  }
+})();
+</script></body></html>`
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(html)
+      },
+    }), 'web-preview: sandbox-check route')
+
     // GET /web-preview/__probe?u=<urlencoded target url>
     // Server-side reachability probe. Cross-origin iframes hide HTTP status and
     // load errors from the parent, so this is the ONLY way the Client can tell
@@ -348,6 +404,7 @@ function proxy(req, res, origin, upstreamPath, opts) {
       up.on('end', () => {
         let html = Buffer.concat(chunks).toString('utf8')
         if (opts.subPrefix) html = rewriteForSubPath(html, opts.subPrefix)
+        html = stripViteHmr(html)
         html = injectCaptureScript(html)
         const body = Buffer.from(html, 'utf8')
         outHeaders['content-length'] = String(body.length)
@@ -390,6 +447,31 @@ function proxy(req, res, origin, upstreamPath, opts) {
  * `sub` must end with `/` and is the URL prefix of the proxied app relative
  * to the DSH origin (e.g. `/web-preview/__proxy/127.0.0.1%3A3001/`).
  */
+/**
+ * Strip Vite's HMR client (`/@vite/client`) from proxied HTML.
+ *
+ * Why: Vite's dev injects a client that opens a WebSocket back to the dev
+ * server at `ws://<host>:<port>` to do hot-module replacement. When previewing
+ * REMOTELY (browser on another machine reaching the DSH host through a
+ * tunnel/reverse-proxy), that WebSocket target is unreachable, so the client
+ * retries forever (`WebSocket ... failed` / `connection lost, retry #N`) and the
+ * app's boot path stalls → blank page. Removing the client lets the app render
+ * normally; the only trade-off is no hot-reload (manual refresh instead).
+ *
+ * Idempotent and conservative: only touches `/@vite/client` (script + any
+ * modulepreload link); never throws.
+ */
+function stripViteHmr(html) {
+  if (!html || html.indexOf('/@vite/client') === -1) return html
+  // Remove the module script that loads the HMR client, e.g.
+  //   <script type="module" src="/@vite/client"></script>
+  // (the src may be sub-path prefixed already, so match any src ending in it).
+  html = html.replace(/<script\b[^>]*\bsrc=["'][^"']*\/@vite\/client[^"']*["'][^>]*>\s*<\/script>/gi, '')
+  // Remove modulepreload hints pointing at the client.
+  html = html.replace(/<link\b[^>]*\bhref=["'][^"']*\/@vite\/client[^"']*["'][^>]*>/gi, '')
+  return html
+}
+
 function rewriteForSubPath(html, sub) {
   // 1) Prefix root-absolute src/href attributes so they route through the proxy.
   //    e.g. src="/assets/index.js"  ->  src="<sub>assets/index.js"
