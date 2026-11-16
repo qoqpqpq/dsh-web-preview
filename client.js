@@ -1,13 +1,15 @@
 /**
  * Web Preview — persistent browser-side bundle.
  *
- * Two surfaces:
- *  A. A floating button + draggable iframe preview window (shell.overlay),
- *     useful when you want the preview beside the conversation.
- *  B. A `conversation.view` tab ("Web Preview") that embeds the preview
- *     full-size inside the current conversation window, with a collapsible
- *     developer toolbox (Console / Network / Errors) that polls the host
- *     diagnostic buffer.
+ * One surface:
+ *  A `conversation.view` tab ("Web Preview") that embeds the preview
+ *  full-size inside the current conversation window, with a collapsible
+ *  developer toolbox (Console / Network / Errors) that polls the host
+ *  diagnostic buffer. This tab is the single entry point; the original
+ *  floating FAB (shell.overlay) was removed as redundant.
+ *
+ * If the slots service is unavailable (no conversation tab to mount into),
+ * a plain-DOM floating window is appended to the body as a fallback.
  *
  * The embedded tab must render as a React component (the slot system renders
  * React elements), so the DOM-heavy preview UI is mounted into a React host
@@ -801,47 +803,30 @@ window.__ModuleLoader__.load({
         })
         .catch(() => {})
 
-      // Build both surfaces once config is in hand. `go()` is idempotent-safe:
+      // Build surfaces once config is in hand. `go()` is idempotent-safe:
       // each surface builds at most once per apply.
-      let builtFloating = false
+      //
+      // Only the embedded conversation-view tab is registered. The original
+      // floating FAB (`shell.overlay`) was removed as redundant — the tab is
+      // the single, always-present entry point for the preview. buildFloating()
+      // is retained for the no-slots fallback below.
       let builtEmbedded = false
-      ready.then(() => { try { buildFloatingSurface(ctx) } catch (err) { console.error('[dsh-web-preview] floating UI failed:', err) } })
       ready.then(() => { try { buildEmbeddedSurface(ctx) } catch (err) { console.error('[dsh-web-preview] embedded UI failed:', err) } })
 
-      // ── floating window surface ───────────────────────────────────────────
-      // Mounted into a React host so the shell's own re-renders don't wipe it.
-      // If React is unavailable, fall back to a plain body append (best-effort).
+      // ── floating window surface (FALLBACK ONLY) ───────────────────────────
+      // Registered ONLY when the slots service is unavailable, so there is
+      // still some way to open the preview. When slots exist, the embedded tab
+      // above is the sole entry point and no floating FAB is mounted.
       let container = null
       function buildFloatingSurface(ctx) {
-        if (builtFloating) return
-        builtFloating = true
-        if (React && useEffect && useRef) {
-          const FloatingHost = () => {
-            const hostRef = useRef(null)
-            useEffect(() => {
-              if (!hostRef.current) return
-              const built = buildFloating()
-              hostRef.current.appendChild(built.root)
-              // destroy() releases the draggable document listeners + timers.
-              return () => { try { built.panel.destroy() } catch (_) {}; try { hostRef.current.innerHTML = '' } catch (_) {} }
-            }, [])
-            return React.createElement('div', { ref: hostRef })
-          }
-          try {
-            ctx.slots.inject('shell.overlay', () => ctx.slots.register({
-              name: 'shell.overlay',
-              id: 'web-preview-fab',
-              order: 50,
-            }, () => React.createElement(FloatingHost)))
-          } catch (_) {}
-        } else {
-          container = document.createElement('div')
-          container.id = 'dsh-web-preview-root'
-          container.setAttribute('data-plugin', 'dsh-web-preview')
-          document.body.appendChild(container)
-          const built = buildFloating()
-          container.appendChild(built.root)
-        }
+        if (ctx.slots !== undefined) return
+        if (React && useEffect && useRef) return // slots missing but React present: nothing to mount into
+        container = document.createElement('div')
+        container.id = 'dsh-web-preview-root'
+        container.setAttribute('data-plugin', 'dsh-web-preview')
+        document.body.appendChild(container)
+        const built = buildFloating()
+        container.appendChild(built.root)
       }
 
       // ── embedded conversation-view surface ────────────────────────────────
