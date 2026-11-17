@@ -239,36 +239,32 @@ export function apply(ctx, config) {
           target = u.searchParams.get('target') || ''
         } catch (_) {}
         const sbFull = 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox'
-        const sbMin = 'allow-scripts allow-same-origin'
         const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>web-preview sandbox check</title><style>
 body{font:14px/1.5 system-ui,sans-serif;margin:0;padding:16px;background:#f5f5f7;color:#222}
 h2{font-size:15px;margin:14px 0 4px}
-.grid{display:flex;gap:10px}.col{flex:1}.frame{height:300px;border:1px solid #ccc;border-radius:8px;overflow:hidden;background:#fff}
+.grid{display:flex;gap:10px}.col{flex:1}.frame{height:260px;border:1px solid #ccc;border-radius:8px;overflow:hidden;background:#fff}
 .frame iframe{width:100%;height:100%;border:0;display:block}
-.cap{font-size:12px;color:#666;margin:2px 0 8px}code{background:#eee;padding:1px 4px;border-radius:4px;font-size:11px;word-break:break-all}
-.ok{color:#16a34a;font-weight:600}.bad{color:#dc2626;font-weight:600}
+.cap{font-size:12px;color:#666;margin:4px 0 8px}code{background:#eee;padding:1px 4px;border-radius:4px;font-size:11px;word-break:break-all}
 </style></head><body>
-<h2>web-preview 沙箱对比诊断</h2>
-<p class="cap">三个 iframe 都通过<strong>同一个代理</strong>加载目标页,只有 sandbox 不同。哪个能正常显示,就说明该用那种 sandbox 配置。</p>
-<p class="cap">目标: <code>${target.replace(/[<>&]/g, '')}</code></p>
+<h2>web-preview 三联对照诊断</h2>
+<p class="cap">三个 iframe 都通过<strong>同一个代理</strong>、用<strong>与插件相同的 sandbox</strong>加载。
+①纯静态(内联 JS) ②极简 ES module ③你的目标页。哪个白屏,就把问题定位到对应那一层。</p>
+<p class="cap">③ 目标: <code>${target.replace(/[<>&]/g, '')}</code></p>
 <div class="grid">
-  <div class="col"><div class="frame"><iframe id="f0"></iframe></div><p class="cap"><strong>① 无 sandbox</strong><br><span id="s0">加载中…</span></p></div>
-  <div class="col"><div class="frame"><iframe id="f1" sandbox="${sbMin}"></iframe></div><p class="cap"><strong>② 最小 sandbox</strong><br><code>allow-scripts allow-same-origin</code><br><span id="s1">加载中…</span></p></div>
-  <div class="col"><div class="frame"><iframe id="f2" sandbox="${sbFull}"></iframe></div><p class="cap"><strong>③ 插件当前 sandbox</strong><br><code>${sbFull}</code><br><span id="s2">加载中…</span></p></div>
+  <div class="col"><div class="frame"><iframe id="c1" sandbox="${sbFull}"></iframe></div><p class="cap"><strong>① 纯静态 + 内联 JS</strong><br>若白屏 = 沙箱挡了所有脚本</p></div>
+  <div class="col"><div class="frame"><iframe id="c2" sandbox="${sbFull}"></iframe></div><p class="cap"><strong>② 极简 ES module</strong><br>若①好②白 = 沙箱挡 ES module</p></div>
+  <div class="col"><div class="frame"><iframe id="c3" sandbox="${sbFull}"></iframe></div><p class="cap"><strong>③ 你的目标页</strong><br>若①②好③白 = 目标页自身问题(Vite/HMR 等)</p></div>
 </div>
 <script>
 (function(){
-  var enc = encodeURIComponent(${JSON.stringify(target)});
-  var url = location.origin + '${APP_PREFIX}/__proxy/' + enc + '/';
-  var ids = ['f0','f1','f2'], st = ['s0','s1','s2'];
-  for (var i=0;i<ids.length;i++){
-    (function(idx){
-      var f = document.getElementById(ids[idx]);
-      f.onload = function(){ document.getElementById(st[idx]).innerHTML = '<span class="ok">onload 已触发</span>（看上面是否白屏）'; };
-      f.src = url;
-    })(i);
-  }
+  function px(u){ return location.origin + '${APP_PREFIX}/__proxy/' + encodeURIComponent(u) + '/'; }
+  // ① 静态对照;② 极简 ES module 对照(这两个跑在本机 8201/8202)
+  document.getElementById('c1').src = px('http://127.0.0.1:8201/');
+  document.getElementById('c2').src = px('http://127.0.0.1:8202/');
+  // ③ 用户目标页
+  var t = ${JSON.stringify(target)};
+  if (t) document.getElementById('c3').src = px(t);
 })();
 </script></body></html>`
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
@@ -413,8 +409,28 @@ function proxy(req, res, origin, upstreamPath, opts) {
       })
       up.on('error', () => { if (!res.headersSent) { res.writeHead(502); res.end() } })
     } else {
-      res.writeHead(up.statusCode ?? 502, outHeaders)
-      up.pipe(res)
+      // Non-HTML: JS modules and CSS also reference the app by root-absolute
+      // paths (Vite rewrites `import x from '/src/y.ts'`), which the browser
+      // would resolve against the DSH origin → 404 → the whole module graph
+      // fails to load → blank page. Rewrite those to route through the proxy
+      // too, exactly like the HTML asset rewrite above.
+      const ctype = String(outHeaders['content-type'] || '').toLowerCase()
+      if (opts.subPrefix && (ctype.includes('javascript') || ctype.includes('ecmascript') || ctype.includes('css'))) {
+        const chunks = []
+        up.on('data', c => chunks.push(c))
+        up.on('end', () => {
+          let text = Buffer.concat(chunks).toString('utf8')
+          text = rewriteRootAbsolute(text, opts.subPrefix)
+          const body = Buffer.from(text, 'utf8')
+          outHeaders['content-length'] = String(body.length)
+          res.writeHead(up.statusCode ?? 200, outHeaders)
+          res.end(body)
+        })
+        up.on('error', () => { if (!res.headersSent) { res.writeHead(502); res.end() } })
+      } else {
+        res.writeHead(up.statusCode ?? 502, outHeaders)
+        up.pipe(res)
+      }
     }
   })
   fwd.on('error', (err) => {
@@ -447,6 +463,39 @@ function proxy(req, res, origin, upstreamPath, opts) {
  * `sub` must end with `/` and is the URL prefix of the proxied app relative
  * to the DSH origin (e.g. `/web-preview/__proxy/127.0.0.1%3A3001/`).
  */
+/**
+ * Rewrite root-absolute paths inside a JS/CSS body so they route through the
+ * proxy sub-path.
+ *
+ * Vite dev rewrites the app's imports to root-absolute specifiers, e.g.
+ *   import { x } from '/src/adapters/backend.ts'
+ * Under the proxy the page is served from `/web-preview/__proxy/<enc>/`, so the
+ * browser resolves `/src/...` against the DSH origin → 404 → the entire module
+ * graph fails to load → blank page (the HTML `src`/`href` rewrite doesn't touch
+ * these because they live inside the JS, not the document).
+ *
+ * We only rewrite QUOTED paths that start with a single `/` (skip `//`=
+ * protocol-relative, already-prefixed, and any specifier with a scheme). That
+ * precisely targets import/export/dynamic-import/fetch/CSS-url specifiers while
+ * leaving strings, comments-ish content, and already-proxied paths alone.
+ */
+function rewriteRootAbsolute(text, sub) {
+  // sub always ends with '/' (it's `<APP_PREFIX>/__proxy/<enc>/`).
+  // Rewrite a QUOTED path that starts with a single '/' — i.e. import/export/
+  // dynamic-import/fetch/CSS-url specifiers like '/src/x.ts'. Skip:
+  //   • already-proxied paths (start with `sub`)
+  //   • protocol-relative '//...' (would collapse to '/...')
+  // Matching through the closing quote keeps us from touching division, regex
+  // literals, or URLs that merely contain a slash.
+  return text.replace(/(["'])(\/[^"']*)/g, (m, q, path) => {
+    if (path.startsWith('//')) return m
+    if (path.startsWith(sub)) return m
+    // sub ends with '/', path starts with '/' — drop the dup so we don't
+    // produce `...%2F//src/...` (a double slash the upstream won't serve).
+    return q + sub + path.replace(/^\//, '')
+  })
+}
+
 /**
  * Strip Vite's HMR client (`/@vite/client`) from proxied HTML.
  *
