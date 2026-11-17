@@ -481,18 +481,20 @@ function proxy(req, res, origin, upstreamPath, opts) {
  */
 function rewriteRootAbsolute(text, sub) {
   // sub always ends with '/' (it's `<APP_PREFIX>/__proxy/<enc>/`).
-  // Rewrite a QUOTED path that starts with a single '/' — i.e. import/export/
-  // dynamic-import/fetch/CSS-url specifiers like '/src/x.ts'. Skip:
-  //   • already-proxied paths (start with `sub`)
-  //   • protocol-relative '//...' (would collapse to '/...')
-  // Matching through the closing quote keeps us from touching division, regex
-  // literals, or URLs that merely contain a slash.
-  return text.replace(/(["'])(\/[^"']*)/g, (m, q, path) => {
+  //
+  // Rewrite ONLY import/export specifiers that are root-absolute ('/src/x.ts').
+  // We must NOT blanket-rewrite every quoted '/...' string: JS is full of regex
+  // literals and strings that start with '/' (e.g. gpx-export.ts builds a regex
+  // `/eG1s...\/.../`), and injecting the prefix into those produces
+  // `SyntaxError: Invalid regular expression flags` → the whole module fails to
+  // load → blank page. So anchor to the import/export keywords and only touch
+  // the quoted specifier that follows, skipping already-proxied ('/web-preview')
+  // and protocol-relative ('//') specifiers.
+  var SPEC = /(\bimport\s+|\bexport\s+[^;{]*?\bfrom\s+|\bfrom\s+)(["'])(\/[^"']*)/g
+  return text.replace(SPEC, (m, kw, q, path) => {
     if (path.startsWith('//')) return m
     if (path.startsWith(sub)) return m
-    // sub ends with '/', path starts with '/' — drop the dup so we don't
-    // produce `...%2F//src/...` (a double slash the upstream won't serve).
-    return q + sub + path.replace(/^\//, '')
+    return kw + q + sub + path.replace(/^\//, '')
   })
 }
 
