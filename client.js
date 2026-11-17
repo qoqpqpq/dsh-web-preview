@@ -536,10 +536,21 @@ window.__ModuleLoader__.load({
 
         // Tear down any previous frame before building a fresh one.
         if (frame) { try { frame.src = 'about:blank' } catch (_) {} try { scaler.removeChild(frame) } catch (_) {} frame = null }
+        // Create the frame ALREADY pointing at the proxy URL, with NO sandbox.
+        //
+        // Two earlier approaches both blanked the page for a Vite/dev app:
+        //   • sandbox="allow-scripts allow-same-origin ..." — in a sandboxed
+        //     frame the app's ES-module graph wouldn't execute when reached
+        //     remotely, so the SPA never mounted (white page).
+        //   • src="about:blank" then setTimeout(() => frame.src = target) —
+        //     Chrome blocks the resulting cross-origin navigation from the
+        //     about:blank frame ("Unsafe attempt to load URL ... from frame
+        //     with URL about:blank"), leaving Chrome's own error page in the
+        //     frame (also white).
+        // Creating it directly with the final src and no sandbox avoids both.
         frame = el('iframe', {
           className: 'wprev-frame',
-          src: 'about:blank',
-          sandbox: 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox',
+          src: target,
           referrerpolicy: 'no-referrer',
         })
         scaler.appendChild(frame)
@@ -570,9 +581,6 @@ window.__ModuleLoader__.load({
         }
         // NOTE: cross-origin frame load *errors* do not surface to the parent;
         // `onerror` is unreliable here, so the timeout + probe path handles it.
-
-        // Defer the real navigation so the frame is attached first.
-        setTimeout(() => { if (!destroyed && frame) { try { frame.src = target } catch (_) {} } }, 0)
         extA.href = target
       }
 
